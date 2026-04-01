@@ -110,6 +110,42 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
             Encoding.ASCII.GetString(expected));
     }
 
+    [Fact]
+    public async Task Server_Http1AndHttp2_Cleartext_SelectsHttp2_WhenH2cPrefaceIsFragmented()
+    {
+        var expectedResponse = Encoding.ASCII.GetString(new byte[]
+        {
+                0x00, 0x00, 0x18,
+                0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
+                0x00, 0x04, 0x00, 0x0C, 0x00, 0x00,
+                0x00, 0x06, 0x00, 0x00, 0x80, 0x00,
+                0x00, 0x08, 0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x04,
+                0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x0F, 0x00, 0x01,
+        });
+
+        var testContext = new TestServiceContext(LoggerFactory);
+        var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0))
+        {
+            Protocols = HttpProtocols.Http1AndHttp2
+        };
+
+        await using var server = new TestServer(context => Task.CompletedTask, testContext, listenOptions);
+        using var connection = server.CreateConnection();
+
+        var preface = Http2Connection.ClientPreface.ToArray();
+
+        await connection.Stream.WriteAsync(preface.AsMemory(0, 8));
+        await connection.Stream.FlushAsync();
+        await Task.Yield();
+        await connection.Stream.WriteAsync(preface.AsMemory(8));
+        await connection.Stream.FlushAsync();
+
+        await connection.Receive(expectedResponse);
+    }
+
     private async Task TestSuccess(HttpProtocols serverProtocols, string request, string expectedResponse)
     {
         var testContext = new TestServiceContext(LoggerFactory);

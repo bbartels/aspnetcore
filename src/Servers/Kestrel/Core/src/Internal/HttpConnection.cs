@@ -89,27 +89,25 @@ internal sealed class HttpConnection : ITimeoutHandler
             using var closedRegistration = _context.ConnectionContext.ConnectionClosed.Register(state => ((HttpConnection)state!).OnConnectionClosed(), this);
 
             IRequestProcessor? requestProcessor = null;
+            string? httpVersion = null;
 
             switch (await SelectProtocolAsync())
             {
                 case HttpProtocols.Http1:
                     // _http1Connection must be initialized before adding the connection to the connection manager
-                    requestProcessor = _http1Connection = new Http1Connection<TContext>((HttpConnectionContext)_context);
-                    _protocolSelectionState = ProtocolSelectionState.Selected;
-                    AddMetricsHttpProtocolTag(KestrelMetrics.Http11);
+                    requestProcessor = new Http1Connection<TContext>((HttpConnectionContext)_context);
+                    httpVersion = KestrelMetrics.Http11;
                     break;
                 case HttpProtocols.Http2:
                     // _http2Connection must be initialized before yielding control to the transport thread,
                     // to prevent a race condition where _http2Connection.Abort() is called just as
                     // _http2Connection is about to be initialized.
                     requestProcessor = new Http2Connection((HttpConnectionContext)_context);
-                    _protocolSelectionState = ProtocolSelectionState.Selected;
-                    AddMetricsHttpProtocolTag(KestrelMetrics.Http2);
+                    httpVersion = KestrelMetrics.Http2;
                     break;
                 case HttpProtocols.Http3:
                     requestProcessor = new Http3Connection((HttpMultiplexedConnectionContext)_context);
-                    _protocolSelectionState = ProtocolSelectionState.Selected;
-                    AddMetricsHttpProtocolTag(KestrelMetrics.Http3);
+                    httpVersion = KestrelMetrics.Http3;
                     break;
                 case HttpProtocols.None:
                     // An error was already logged in SelectProtocol(), but we should close the connection.
@@ -120,10 +118,9 @@ internal sealed class HttpConnection : ITimeoutHandler
                     throw new NotSupportedException($"{nameof(SelectProtocolAsync)} returned something other than Http1, Http2 or None.");
             }
 
-            _requestProcessor = requestProcessor;
-
-            if (requestProcessor != null)
+            if (requestProcessor != null && TryActivateRequestProcessor(requestProcessor))
             {
+                AddMetricsHttpProtocolTag(httpVersion!);
                 await requestProcessor.ProcessRequestsAsync(httpApplication);
             }
         }
@@ -156,6 +153,25 @@ internal sealed class HttpConnection : ITimeoutHandler
         _requestProcessor = requestProcessor;
         _http1Connection = requestProcessor as Http1Connection;
         _protocolSelectionState = ProtocolSelectionState.Selected;
+    }
+
+    private bool TryActivateRequestProcessor(IRequestProcessor requestProcessor)
+    {
+        lock (_protocolSelectionLock)
+        {
+            if (_protocolSelectionState == ProtocolSelectionState.Aborted)
+            {
+                return false;
+            }
+
+            Debug.Assert(_protocolSelectionState == ProtocolSelectionState.Initializing, $"Unexpected {nameof(ProtocolSelectionState)} {_protocolSelectionState}.");
+
+            _requestProcessor = requestProcessor;
+            _http1Connection = requestProcessor as Http1Connection;
+            _protocolSelectionState = ProtocolSelectionState.Selected;
+
+            return true;
+        }
     }
 
     private void StopProcessingNextRequest(ConnectionEndReason reason)
@@ -322,64 +338,89 @@ internal sealed class HttpConnection : ITimeoutHandler
 
             // If the connection was aborted during negotiation (e.g. by a timeout handler or a
             // graceful-shutdown signal), do not proceed to create a protocol handler.
-            if (_protocolSelectionState == ProtocolSelectionState.Aborted)
+            lock (_protocolSelectionLock)
             {
-                return HttpProtocols.None;
+                if (_protocolSelectionState == ProtocolSelectionState.Aborted)
+                {
+                    return HttpProtocols.None;
+                }
             }
         }
 
         return protocol;
     }
 
-    // Performs a single read on the transport input and returns:
-    //   • HttpProtocols.Http2  – if the first ≥24 bytes are exactly the HTTP/2 connection preface
-    //   • HttpProtocols.Http1  – for everything else (short read, wrong bytes, cancelled, EOF)
+    // Performs as many reads as needed to distinguish an HTTP/2 client preface from a non-HTTP/2
+    // connection and returns:
+    //   • HttpProtocols.Http2  – if the first 24 bytes are exactly the HTTP/2 connection preface
+    //   • HttpProtocols.Http1  – if the received bytes diverge from the preface, the read is
+    //                            cancelled, or the connection completes before the preface arrives
     //
     // Bytes are never consumed so that the chosen protocol handler can process them normally.
-    // A single read (rather than a loop) avoids deadlocks when clients send fewer than 24 bytes
-    // before waiting for a server response (e.g. an HTTP/1.0 request or a partial request line).
     private static async ValueTask<HttpProtocols> NegotiateH2cProtocolAsync(PipeReader input)
     {
         var prefaceLength = Http2Connection.ClientPreface.Length;
 
-        var result = await input.ReadAsync();
-        var buffer = result.Buffer;
-
-        try
+        while (true)
         {
-            if (!result.IsCanceled && buffer.Length >= prefaceLength)
+            var result = await input.ReadAsync();
+            var buffer = result.Buffer;
+            var consumed = buffer.Start;
+            var examined = buffer.Start;
+
+            try
             {
-                // Leave all bytes unconsumed so the selected protocol handler can process them.
-                input.AdvanceTo(buffer.Start);
+                if (result.IsCanceled)
+                {
+                    return HttpProtocols.Http1;
+                }
 
-                return IsHttp2Preface(buffer.Slice(0, prefaceLength))
-                    ? HttpProtocols.Http2
-                    : HttpProtocols.Http1;
+                if (!HasHttp2PrefacePrefix(buffer))
+                {
+                    return HttpProtocols.Http1;
+                }
+
+                if (buffer.Length >= prefaceLength)
+                {
+                    return HttpProtocols.Http2;
+                }
+
+                if (result.IsCompleted)
+                {
+                    return HttpProtocols.Http1;
+                }
+
+                // Keep all bytes available for the eventual protocol handler, but mark the current
+                // data as examined so the reader will wait for more input before completing again.
+                examined = buffer.End;
             }
-
-            // Cancelled, completed, or too few bytes – fall back to Http1 and leave whatever
-            // bytes arrived for the Http1 handler to process.
-            input.AdvanceTo(buffer.Start);
-            return HttpProtocols.Http1;
-        }
-        catch
-        {
-            input.AdvanceTo(buffer.Start);
-            throw;
+            finally
+            {
+                input.AdvanceTo(consumed, examined);
+            }
         }
     }
 
     private static bool IsHttp2Preface(ReadOnlySequence<byte> preface)
+        => SequenceEquals(preface, Http2Connection.ClientPreface);
+
+    private static bool HasHttp2PrefacePrefix(ReadOnlySequence<byte> buffer)
     {
-        if (preface.IsSingleSegment)
+        var prefixLength = (int)Math.Min(buffer.Length, (long)Http2Connection.ClientPreface.Length);
+
+        return SequenceEquals(buffer.Slice(0, prefixLength), Http2Connection.ClientPreface.Slice(0, prefixLength));
+    }
+
+    private static bool SequenceEquals(ReadOnlySequence<byte> sequence, ReadOnlySpan<byte> expected)
+    {
+        if (sequence.IsSingleSegment)
         {
-            return preface.FirstSpan.SequenceEqual(Http2Connection.ClientPreface);
+            return sequence.FirstSpan.SequenceEqual(expected);
         }
 
-        // Multi-segment path: copy the 24-byte preface onto the stack to avoid a heap allocation.
-        Span<byte> span = stackalloc byte[Http2Connection.ClientPreface.Length];
-        preface.CopyTo(span);
-        return span.SequenceEqual(Http2Connection.ClientPreface);
+        Span<byte> span = stackalloc byte[expected.Length];
+        sequence.CopyTo(span);
+        return span.SequenceEqual(expected);
     }
 
     private void Tick()
