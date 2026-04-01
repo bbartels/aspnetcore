@@ -16,6 +16,20 @@ namespace Microsoft.AspNetCore.Server.Kestrel.InMemory.FunctionalTests;
 
 public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
 {
+    private static readonly string Http2ClientPreface = Encoding.ASCII.GetString(Http2Connection.ClientPreface);
+    private static readonly string Http2ServerPreface = Encoding.ASCII.GetString(new byte[]
+    {
+            0x00, 0x00, 0x18,
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
+            0x00, 0x04, 0x00, 0x0C, 0x00, 0x00,
+            0x00, 0x06, 0x00, 0x00, 0x80, 0x00,
+            0x00, 0x08, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x04,
+            0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0F, 0x00, 0x01,
+    });
+
     [Fact]
     public Task Server_NoProtocols_Error()
     {
@@ -36,25 +50,7 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
 
     [Fact]
     public Task Server_Http2Only_Cleartext_Success()
-    {
-        // Expect a SETTINGS frame with default settings then a connection-level WINDOW_UPDATE frame.
-        var expected = new byte[]
-        {
-                0x00, 0x00, 0x18, // Payload Length (6 * settings count)
-                0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // SETTINGS frame (type 0x04)
-                0x00, 0x03, 0x00, 0x00, 0x00, 0x64, // Connection limit (100)
-                0x00, 0x04, 0x00, 0x0C, 0x00, 0x00, // Initial stream window size (768 KiB)
-                0x00, 0x06, 0x00, 0x00, 0x80, 0x00, // Header size limit (32 KiB)
-                0x00, 0x08, 0x00, 0x00, 0x00, 0x01, // CONNECT enabled
-                0x00, 0x00, 0x04, // Payload Length (4)
-                0x08, 0x00, 0x00, 0x00, 0x00, 0x00, // WINDOW_UPDATE frame (type 0x08)
-                0x00, 0x0F, 0x00, 0x01, // Diff between configured and protocol default (1 MiB - 0XFFFF)
-        };
-
-        return TestSuccess(HttpProtocols.Http2,
-            Encoding.ASCII.GetString(Http2Connection.ClientPreface),
-            Encoding.ASCII.GetString(expected));
-    }
+        => TestHttp2PrefaceSuccess(HttpProtocols.Http2);
 
     /// <summary>
     /// When a cleartext endpoint advertises both HTTP/1 and HTTP/2 and the client sends the HTTP/2
@@ -62,25 +58,7 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
     /// </summary>
     [Fact]
     public Task Server_Http1AndHttp2_Cleartext_SelectsHttp2_WhenH2cPrefaceSent()
-    {
-        // Expect a SETTINGS frame with default settings then a connection-level WINDOW_UPDATE frame.
-        var expected = new byte[]
-        {
-                0x00, 0x00, 0x18, // Payload Length (6 * settings count)
-                0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // SETTINGS frame (type 0x04)
-                0x00, 0x03, 0x00, 0x00, 0x00, 0x64, // Connection limit (100)
-                0x00, 0x04, 0x00, 0x0C, 0x00, 0x00, // Initial stream window size (768 KiB)
-                0x00, 0x06, 0x00, 0x00, 0x80, 0x00, // Header size limit (32 KiB)
-                0x00, 0x08, 0x00, 0x00, 0x00, 0x01, // CONNECT enabled
-                0x00, 0x00, 0x04, // Payload Length (4)
-                0x08, 0x00, 0x00, 0x00, 0x00, 0x00, // WINDOW_UPDATE frame (type 0x08)
-                0x00, 0x0F, 0x00, 0x01, // Diff between configured and protocol default (1 MiB - 0XFFFF)
-        };
-
-        return TestSuccess(HttpProtocols.Http1AndHttp2,
-            Encoding.ASCII.GetString(Http2Connection.ClientPreface),
-            Encoding.ASCII.GetString(expected));
-    }
+        => TestHttp2PrefaceSuccess(HttpProtocols.Http1AndHttp2);
 
     /// <summary>
     /// When a cleartext endpoint advertises HTTP/1, HTTP/2, and HTTP/3, and the client sends the
@@ -89,48 +67,13 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
     /// </summary>
     [Fact]
     public Task Server_Http1AndHttp2AndHttp3_Cleartext_SelectsHttp2_WhenH2cPrefaceSent()
-    {
-        var expected = new byte[]
-        {
-                0x00, 0x00, 0x18,
-                0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
-                0x00, 0x04, 0x00, 0x0C, 0x00, 0x00,
-                0x00, 0x06, 0x00, 0x00, 0x80, 0x00,
-                0x00, 0x08, 0x00, 0x00, 0x00, 0x01,
-                0x00, 0x00, 0x04,
-                0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x0F, 0x00, 0x01,
-        };
-
-        // Http3 requires a QUIC/multiplexed transport; on the cleartext InMemory transport the
-        // server must negotiate between Http1 and Http2 using the connection preface.
-        return TestSuccess(HttpProtocols.Http1AndHttp2AndHttp3,
-            Encoding.ASCII.GetString(Http2Connection.ClientPreface),
-            Encoding.ASCII.GetString(expected));
-    }
+        => TestHttp2PrefaceSuccess(HttpProtocols.Http1AndHttp2AndHttp3);
 
     [Fact]
     public async Task Server_Http1AndHttp2_Cleartext_SelectsHttp2_WhenH2cPrefaceIsFragmented()
     {
-        var expectedResponse = Encoding.ASCII.GetString(new byte[]
-        {
-                0x00, 0x00, 0x18,
-                0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
-                0x00, 0x04, 0x00, 0x0C, 0x00, 0x00,
-                0x00, 0x06, 0x00, 0x00, 0x80, 0x00,
-                0x00, 0x08, 0x00, 0x00, 0x00, 0x01,
-                0x00, 0x00, 0x04,
-                0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x0F, 0x00, 0x01,
-        });
-
         var testContext = new TestServiceContext(LoggerFactory);
-        var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0))
-        {
-            Protocols = HttpProtocols.Http1AndHttp2
-        };
+        var listenOptions = CreateListenOptions(HttpProtocols.Http1AndHttp2);
 
         await using var server = new TestServer(context => Task.CompletedTask, testContext, listenOptions);
         using var connection = server.CreateConnection();
@@ -143,16 +86,16 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
         await connection.Stream.WriteAsync(preface.AsMemory(8));
         await connection.Stream.FlushAsync();
 
-        await connection.Receive(expectedResponse);
+        await connection.Receive(Http2ServerPreface);
     }
+
+    private Task TestHttp2PrefaceSuccess(HttpProtocols serverProtocols)
+        => TestSuccess(serverProtocols, Http2ClientPreface, Http2ServerPreface);
 
     private async Task TestSuccess(HttpProtocols serverProtocols, string request, string expectedResponse)
     {
         var testContext = new TestServiceContext(LoggerFactory);
-        var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0))
-        {
-            Protocols = serverProtocols
-        };
+        var listenOptions = CreateListenOptions(serverProtocols);
 
         await using (var server = new TestServer(context => Task.CompletedTask, testContext, listenOptions))
         {
@@ -168,10 +111,7 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
         where TException : Exception
     {
         var testContext = new TestServiceContext(LoggerFactory);
-        var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0))
-        {
-            Protocols = serverProtocols
-        };
+        var listenOptions = CreateListenOptions(serverProtocols);
 
         await using (var server = new TestServer(context => Task.CompletedTask, testContext, listenOptions))
         {
@@ -185,4 +125,10 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
             && message.EventId.Id == 0
             && message.Message == expectedErrorMessage);
     }
+
+    private static ListenOptions CreateListenOptions(HttpProtocols protocols)
+        => new(new IPEndPoint(IPAddress.Loopback, 0))
+        {
+            Protocols = protocols
+        };
 }

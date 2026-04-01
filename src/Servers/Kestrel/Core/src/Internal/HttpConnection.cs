@@ -88,35 +88,7 @@ internal sealed class HttpConnection : ITimeoutHandler
             // Register for connection close
             using var closedRegistration = _context.ConnectionContext.ConnectionClosed.Register(state => ((HttpConnection)state!).OnConnectionClosed(), this);
 
-            IRequestProcessor? requestProcessor = null;
-            string? httpVersion = null;
-
-            switch (await SelectProtocolAsync())
-            {
-                case HttpProtocols.Http1:
-                    // _http1Connection must be initialized before adding the connection to the connection manager
-                    requestProcessor = new Http1Connection<TContext>((HttpConnectionContext)_context);
-                    httpVersion = KestrelMetrics.Http11;
-                    break;
-                case HttpProtocols.Http2:
-                    // _http2Connection must be initialized before yielding control to the transport thread,
-                    // to prevent a race condition where _http2Connection.Abort() is called just as
-                    // _http2Connection is about to be initialized.
-                    requestProcessor = new Http2Connection((HttpConnectionContext)_context);
-                    httpVersion = KestrelMetrics.Http2;
-                    break;
-                case HttpProtocols.Http3:
-                    requestProcessor = new Http3Connection((HttpMultiplexedConnectionContext)_context);
-                    httpVersion = KestrelMetrics.Http3;
-                    break;
-                case HttpProtocols.None:
-                    // An error was already logged in SelectProtocol(), but we should close the connection.
-                    break;
-
-                default:
-                    // SelectProtocol() only returns Http1, Http2, Http3 or None.
-                    throw new NotSupportedException($"{nameof(SelectProtocolAsync)} returned something other than Http1, Http2 or None.");
-            }
+            var (requestProcessor, httpVersion) = CreateRequestProcessor<TContext>(await SelectProtocolAsync());
 
             if (requestProcessor != null && TryActivateRequestProcessor(requestProcessor))
             {
@@ -147,6 +119,20 @@ internal sealed class HttpConnection : ITimeoutHandler
         }
     }
 
+    private (IRequestProcessor? RequestProcessor, string? HttpVersion) CreateRequestProcessor<TContext>(HttpProtocols protocol)
+        where TContext : notnull
+        => protocol switch
+        {
+            // The processor has to be fully constructed before TryActivateRequestProcessor publishes
+            // it. That is especially important for Http2Connection, which can otherwise observe an
+            // abort while it is still being initialized.
+            HttpProtocols.Http1 => (new Http1Connection<TContext>((HttpConnectionContext)_context), KestrelMetrics.Http11),
+            HttpProtocols.Http2 => (new Http2Connection((HttpConnectionContext)_context), KestrelMetrics.Http2),
+            HttpProtocols.Http3 => (new Http3Connection((HttpMultiplexedConnectionContext)_context), KestrelMetrics.Http3),
+            HttpProtocols.None => (null, null),
+            _ => throw new NotSupportedException($"{nameof(SelectProtocolAsync)} returned something other than Http1, Http2 or None.")
+        };
+
     // For testing only
     internal void Initialize(IRequestProcessor requestProcessor)
     {
@@ -174,24 +160,41 @@ internal sealed class HttpConnection : ITimeoutHandler
         }
     }
 
-    private void StopProcessingNextRequest(ConnectionEndReason reason)
+    private ProtocolSelectionState AbortProtocolSelection(bool abortSelected)
     {
-        ProtocolSelectionState previousState;
         lock (_protocolSelectionLock)
         {
-            previousState = _protocolSelectionState;
-            if (previousState == ProtocolSelectionState.Initializing)
+            var previousState = _protocolSelectionState;
+
+            if (previousState == ProtocolSelectionState.Initializing
+                || (abortSelected && previousState == ProtocolSelectionState.Selected))
             {
                 _protocolSelectionState = ProtocolSelectionState.Aborted;
             }
-        }
 
-        switch (previousState)
+            return previousState;
+        }
+    }
+
+    private void CancelPendingProtocolSelection()
+        => _negotiationInput?.CancelPendingRead();
+
+    private bool IsProtocolSelectionAborted()
+    {
+        lock (_protocolSelectionLock)
+        {
+            return _protocolSelectionState == ProtocolSelectionState.Aborted;
+        }
+    }
+
+    private void StopProcessingNextRequest(ConnectionEndReason reason)
+    {
+        switch (AbortProtocolSelection(abortSelected: false))
         {
             case ProtocolSelectionState.Initializing:
                 // Protocol selection (H2C preface detection) is in progress; cancel the pending read
                 // so the selection task can unblock and observe that it has been aborted.
-                _negotiationInput?.CancelPendingRead();
+                CancelPendingProtocolSelection();
                 break;
             case ProtocolSelectionState.Selected:
                 _requestProcessor!.StopProcessingNextRequest(reason);
@@ -203,20 +206,10 @@ internal sealed class HttpConnection : ITimeoutHandler
 
     private void OnConnectionClosed()
     {
-        ProtocolSelectionState previousState;
-        lock (_protocolSelectionLock)
-        {
-            previousState = _protocolSelectionState;
-            if (previousState == ProtocolSelectionState.Initializing)
-            {
-                _protocolSelectionState = ProtocolSelectionState.Aborted;
-            }
-        }
-
-        switch (previousState)
+        switch (AbortProtocolSelection(abortSelected: false))
         {
             case ProtocolSelectionState.Initializing:
-                _negotiationInput?.CancelPendingRead();
+                CancelPendingProtocolSelection();
                 break;
             case ProtocolSelectionState.Selected:
                 _requestProcessor!.OnInputOrOutputCompleted();
@@ -228,21 +221,10 @@ internal sealed class HttpConnection : ITimeoutHandler
 
     private void Abort(ConnectionAbortedException ex, ConnectionEndReason reason)
     {
-        ProtocolSelectionState previousState;
-
-        lock (_protocolSelectionLock)
-        {
-            previousState = _protocolSelectionState;
-            if (previousState != ProtocolSelectionState.Aborted)
-            {
-                _protocolSelectionState = ProtocolSelectionState.Aborted;
-            }
-        }
-
-        switch (previousState)
+        switch (AbortProtocolSelection(abortSelected: true))
         {
             case ProtocolSelectionState.Initializing:
-                _negotiationInput?.CancelPendingRead();
+                CancelPendingProtocolSelection();
                 break;
             case ProtocolSelectionState.Selected:
                 _requestProcessor!.Abort(ex, reason);
@@ -262,32 +244,21 @@ internal sealed class HttpConnection : ITimeoutHandler
         var http2Enabled = _context.Protocols.HasFlag(HttpProtocols.Http2);
         var http3Enabled = _context.Protocols.HasFlag(HttpProtocols.Http3);
 
-        string? error = null;
-
         if (_context.Protocols == HttpProtocols.None)
         {
-            error = CoreStrings.EndPointRequiresAtLeastOneProtocol;
+            return LogAndReturnNoProtocol(CoreStrings.EndPointRequiresAtLeastOneProtocol);
         }
 
         if (isMultiplexTransport)
         {
-            if (http3Enabled)
-            {
-                return HttpProtocols.Http3;
-            }
-
-            error = $"Protocols {_context.Protocols} not supported on multiplexed transport.";
+            return http3Enabled
+                ? HttpProtocols.Http3
+                : LogAndReturnNoProtocol($"Protocols {_context.Protocols} not supported on multiplexed transport.");
         }
 
         if (!http1Enabled && http2Enabled && hasTls && !Http2Id.SequenceEqual(applicationProtocol.Span))
         {
-            error = CoreStrings.EndPointHttp2NotNegotiated;
-        }
-
-        if (error != null)
-        {
-            Log.LogError(0, error);
-            return HttpProtocols.None;
+            return LogAndReturnNoProtocol(CoreStrings.EndPointHttp2NotNegotiated);
         }
 
         if (!hasTls && http1Enabled)
@@ -300,55 +271,58 @@ internal sealed class HttpConnection : ITimeoutHandler
         return http2Enabled && (!hasTls || Http2Id.SequenceEqual(applicationProtocol.Span)) ? HttpProtocols.Http2 : HttpProtocols.Http1;
     }
 
+    private HttpProtocols LogAndReturnNoProtocol(string error)
+    {
+        Log.LogError(0, error);
+        return HttpProtocols.None;
+    }
+
     // Wraps SelectProtocol() and, for cleartext endpoints supporting both HTTP/1 and HTTP/2,
     // peeks at the initial bytes to detect an HTTP/2 prior-knowledge connection preface (RFC 7540
     // Section 3.4) and selects HTTP/2 accordingly.
     private async ValueTask<HttpProtocols> SelectProtocolAsync()
     {
         var protocol = SelectProtocol();
+        var negotiationInput = GetH2cNegotiationInput(protocol);
 
         // Only negotiate H2C when: the synchronous selection chose Http1, the endpoint also
         // advertises Http2, the connection is cleartext (no TLS), and we have direct access to
         // the transport pipe.  All other cases (TLS/ALPN, Http1-only, Http3) are handled above.
-        if (protocol == HttpProtocols.Http1
-            && _context.Protocols.HasFlag(HttpProtocols.Http2)
-            && _context.ConnectionFeatures.Get<ITlsConnectionFeature>() == null
-            && _context is HttpConnectionContext httpConnectionContext)
+        if (negotiationInput is null)
         {
-            // While waiting for the preface, apply the keep-alive timeout so that a connection
-            // that is opened but never sends data is eventually closed (the same timeout that
-            // Http1Connection sets before its first BeginRead).
-            _context.TimeoutControl.SetTimeout(
-                _context.ServiceContext.ServerOptions.Limits.KeepAliveTimeout,
-                TimeoutReason.KeepAlive);
-
-            _negotiationInput = httpConnectionContext.Transport.Input;
-
-            try
-            {
-                protocol = await NegotiateH2cProtocolAsync(_negotiationInput);
-            }
-            finally
-            {
-                _negotiationInput = null;
-                // Cancel the pre-selection keep-alive timeout now that we have determined the protocol
-                // (or aborted). The selected protocol handler will set its own timeout in its startup path.
-                _context.TimeoutControl.CancelTimeout();
-            }
-
-            // If the connection was aborted during negotiation (e.g. by a timeout handler or a
-            // graceful-shutdown signal), do not proceed to create a protocol handler.
-            lock (_protocolSelectionLock)
-            {
-                if (_protocolSelectionState == ProtocolSelectionState.Aborted)
-                {
-                    return HttpProtocols.None;
-                }
-            }
+            return protocol;
         }
 
-        return protocol;
+        // While waiting for the preface, apply the keep-alive timeout so that a connection
+        // that is opened but never sends data is eventually closed (the same timeout that
+        // Http1Connection sets before its first BeginRead).
+        _context.TimeoutControl.SetTimeout(
+            _context.ServiceContext.ServerOptions.Limits.KeepAliveTimeout,
+            TimeoutReason.KeepAlive);
+
+        _negotiationInput = negotiationInput;
+
+        try
+        {
+            protocol = await NegotiateH2cProtocolAsync(negotiationInput);
+            return IsProtocolSelectionAborted() ? HttpProtocols.None : protocol;
+        }
+        finally
+        {
+            _negotiationInput = null;
+            // Cancel the pre-selection keep-alive timeout now that we have determined the protocol
+            // (or aborted). The selected protocol handler will set its own timeout in its startup path.
+            _context.TimeoutControl.CancelTimeout();
+        }
     }
+
+    private PipeReader? GetH2cNegotiationInput(HttpProtocols protocol)
+        => protocol == HttpProtocols.Http1
+            && _context.Protocols.HasFlag(HttpProtocols.Http2)
+            && _context.ConnectionFeatures.Get<ITlsConnectionFeature>() == null
+            && _context is HttpConnectionContext httpConnectionContext
+                ? httpConnectionContext.Transport.Input
+                : null;
 
     // Performs as many reads as needed to distinguish an HTTP/2 client preface from a non-HTTP/2
     // connection and returns:

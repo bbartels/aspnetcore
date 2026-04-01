@@ -92,7 +92,12 @@ public class HttpConnectionTests
     {
         private readonly CancellationTokenSource _connectionClosedRequestedCts = new();
 
-        public CancellationToken ConnectionClosedRequested => _connectionClosedRequestedCts.Token;
+        public CancellationToken ConnectionClosedRequested { get; set; }
+
+        public TestConnectionLifetimeFeature()
+        {
+            ConnectionClosedRequested = _connectionClosedRequestedCts.Token;
+        }
 
         public void OnHeartbeat(Action<object> action, object state)
         {
@@ -124,7 +129,7 @@ public class HttpConnectionTests
         public override void CancelPendingRead()
             => _inner.CancelPendingRead();
 
-        public override void Complete(Exception? exception = null)
+        public override void Complete(Exception exception = null)
             => _inner.Complete(exception);
 
         public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
