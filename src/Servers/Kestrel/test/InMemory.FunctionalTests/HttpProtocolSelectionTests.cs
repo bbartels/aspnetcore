@@ -89,6 +89,24 @@ public class HttpProtocolSelectionTests : TestApplicationErrorLoggerLoggedTest
         await connection.Receive(Http2ServerPreface);
     }
 
+    [Fact]
+    public async Task Server_Http1AndHttp2_Cleartext_FallsBackToHttp1_WhenPrefacePrefixDiverges()
+    {
+        var testContext = new TestServiceContext(LoggerFactory);
+        var listenOptions = CreateListenOptions(HttpProtocols.Http1AndHttp2);
+
+        await using var server = new TestServer(context => Task.CompletedTask, testContext, listenOptions);
+        using var connection = server.CreateConnection();
+
+        await connection.Stream.WriteAsync(Encoding.ASCII.GetBytes("PRI "));
+        await connection.Stream.FlushAsync();
+        await Task.Yield();
+        await connection.Stream.WriteAsync(Encoding.ASCII.GetBytes("/ HTTP/1.1\r\nHost:\r\n\r\n"));
+        await connection.Stream.FlushAsync();
+
+        await connection.Receive("HTTP/1.1 200 OK");
+    }
+
     private Task TestHttp2PrefaceSuccess(HttpProtocols serverProtocols)
         => TestSuccess(serverProtocols, Http2ClientPreface, Http2ServerPreface);
 

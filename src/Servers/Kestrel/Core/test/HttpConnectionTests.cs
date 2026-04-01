@@ -55,6 +55,54 @@ public class HttpConnectionTests
     [Fact]
     public async Task ProcessRequestsAsync_ConnectionClosedDuringH2cNegotiation_CompletesWithoutSelectingProtocol()
     {
+        var (httpConnection, connectionContext, _, readStartedReader, _) = CreateHttpConnectionForH2cNegotiation();
+
+        var processingTask = httpConnection.ProcessRequestsAsync(new DummyApplication());
+
+        await readStartedReader.ReadStarted.Task.DefaultTimeout();
+
+        connectionContext.Abort(new ConnectionAbortedException("Test abort"));
+
+        await processingTask.DefaultTimeout();
+
+        Assert.Null(httpConnection._requestProcessor);
+    }
+
+    [Fact]
+    public async Task ProcessRequestsAsync_GracefulShutdownDuringH2cNegotiation_CompletesWithoutSelectingProtocol()
+    {
+        var (httpConnection, _, lifetimeNotificationFeature, readStartedReader, _) = CreateHttpConnectionForH2cNegotiation();
+
+        var processingTask = httpConnection.ProcessRequestsAsync(new DummyApplication());
+
+        await readStartedReader.ReadStarted.Task.DefaultTimeout();
+
+        lifetimeNotificationFeature.RequestClose();
+
+        await processingTask.DefaultTimeout();
+
+        Assert.Null(httpConnection._requestProcessor);
+    }
+
+    [Fact]
+    public async Task ProcessRequestsAsync_KeepAliveTimeoutDuringH2cNegotiation_CompletesWithoutSelectingProtocol()
+    {
+        var (httpConnection, _, _, readStartedReader, metricsContext) = CreateHttpConnectionForH2cNegotiation();
+
+        var processingTask = httpConnection.ProcessRequestsAsync(new DummyApplication());
+
+        await readStartedReader.ReadStarted.Task.DefaultTimeout();
+
+        httpConnection.OnTimeout(TimeoutReason.KeepAlive);
+
+        await processingTask.DefaultTimeout();
+
+        Assert.Null(httpConnection._requestProcessor);
+        Assert.Equal(ConnectionEndReason.KeepAliveTimeout, metricsContext.ConnectionEndReason);
+    }
+
+    private static (HttpConnection HttpConnection, DefaultConnectionContext ConnectionContext, TestConnectionLifetimeFeature LifetimeNotificationFeature, ReadStartedPipeReader ReadStartedReader, ConnectionMetricsContext MetricsContext) CreateHttpConnectionForH2cNegotiation()
+    {
         var serviceContext = new TestServiceContext();
         var transportPair = DuplexPipe.CreateConnectionPair(new PipeOptions(), new PipeOptions());
         var connectionContext = new DefaultConnectionContext();
@@ -75,17 +123,7 @@ public class HttpConnectionTests
             protocols: HttpProtocols.Http1AndHttp2,
             metricsContext: metricsContext);
 
-        var httpConnection = new HttpConnection(httpConnectionContext);
-
-        var processingTask = httpConnection.ProcessRequestsAsync(new DummyApplication());
-
-        await readStartedReader.ReadStarted.Task.DefaultTimeout();
-
-        connectionContext.Abort(new ConnectionAbortedException("Test abort"));
-
-        await processingTask.DefaultTimeout();
-
-        Assert.Null(httpConnection._requestProcessor);
+        return (new HttpConnection(httpConnectionContext), connectionContext, lifetimeNotificationFeature, readStartedReader, metricsContext);
     }
 
     private sealed class TestConnectionLifetimeFeature : IConnectionHeartbeatFeature, IConnectionLifetimeNotificationFeature
