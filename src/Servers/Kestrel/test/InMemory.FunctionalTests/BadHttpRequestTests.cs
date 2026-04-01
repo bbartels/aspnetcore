@@ -259,7 +259,14 @@ public class BadHttpRequestTests : LoggedTest
         var testMeterFactory = new TestMeterFactory();
         using var connectionDuration = new MetricCollector<double>(testMeterFactory, "Microsoft.AspNetCore.Server.Kestrel", "kestrel.connection.duration");
 
-        await using (var server = new TestServer(context => Task.CompletedTask, new TestServiceContext(LoggerFactory, metrics: new KestrelMetrics(testMeterFactory))))
+        var listenOptions = new ListenOptions(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0))
+        {
+            // Explicitly restrict to HTTP/1 only so that the H2C prior-knowledge path is not taken
+            // and the HTTP/2 preface is correctly rejected with a GOAWAY frame.
+            Protocols = HttpProtocols.Http1,
+        };
+
+        await using (var server = new TestServer(context => Task.CompletedTask, new TestServiceContext(LoggerFactory, metrics: new KestrelMetrics(testMeterFactory)), listenOptions))
         {
             using (var client = server.CreateConnection())
             {
