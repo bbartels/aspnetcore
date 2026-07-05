@@ -147,15 +147,12 @@ internal sealed class KestrelServerImpl : IServer
 
                 if (!hasTls)
                 {
-                    // Http/1 without TLS, no-op HTTP/2 and 3.
+                    // Http/1 without TLS: ALPN is unavailable so HTTP/2 can only be negotiated
+                    // via prior knowledge (H2C, RFC 7540 §3.4) and HTTP/3 requires QUIC/TLS.
                     if (hasHttp1)
                     {
                         if (options.ProtocolsSetExplicitly)
                         {
-                            if (hasHttp2)
-                            {
-                                Trace.Http2DisabledWithHttp1AndNoTls(options.EndPoint);
-                            }
                             if (hasHttp3)
                             {
                                 Trace.Http3DisabledWithHttp1AndNoTls(options.EndPoint);

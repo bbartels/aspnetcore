@@ -50,6 +50,7 @@ internal static class TestContextFactory
         ServiceContext serviceContext,
         IDuplexPipe transport,
         IFeatureCollection connectionFeatures,
+        HttpProtocols protocols = HttpProtocols.Http1,
         MemoryPool<byte> memoryPool = null,
         IPEndPoint localEndPoint = null,
         IPEndPoint remoteEndPoint = null,
@@ -58,7 +59,7 @@ internal static class TestContextFactory
     {
         var context = new HttpConnectionContext(
             "TestConnectionId",
-            HttpProtocols.Http1,
+            protocols,
             altSvcHeader: null,
             connectionContext,
             serviceContext,
