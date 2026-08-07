@@ -111,6 +111,29 @@ public class Http2PrefaceConnectionMiddlewareTests
     }
 
     [Fact]
+    public async Task PreCanceledShutdownDoesNotRecordExpiredTimeout()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromTicks(1);
+        var connection = CreateConnection();
+        var lifetimeFeature = new Mock<IConnectionLifetimeNotificationFeature>();
+        lifetimeFeature.SetupGet(feature => feature.ConnectionClosedRequested).Returns(new CancellationToken(canceled: true));
+        connection.Features.Set(lifetimeFeature.Object);
+        var tags = AddMetricsTagsFeature(connection);
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(_ =>
+        {
+            nextCalled = true;
+            return Task.CompletedTask;
+        }, serviceContext, HttpProtocols.Http1AndHttp2);
+
+        await middleware.OnConnectionAsync(connection);
+
+        Assert.False(nextCalled);
+        Assert.Empty(tags);
+    }
+
+    [Fact]
     public async Task PartialPrefaceEofSelectsHttp1AndReplaysInput()
     {
         var input = "PRI *"u8.ToArray();
@@ -203,6 +226,69 @@ public class Http2PrefaceConnectionMiddlewareTests
     }
 
     [Fact]
+    public async Task UnexpectedOperationCanceledExceptionWithReadTokenIsSurfaced()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromMilliseconds(50);
+        var input = new ControllablePipeReader { ThrowOperationCanceledWithReadToken = true };
+        var connection = CreateConnection(input);
+        var middleware = new Http2PrefaceConnectionMiddleware(_ => Task.CompletedTask, serviceContext, HttpProtocols.Http1AndHttp2);
+
+        var actual = await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Equal("unexpected", actual.Message);
+    }
+
+    [Fact]
+    public async Task UnrelatedOperationCanceledExceptionDuringChunkCancellationIsSurfaced()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
+        var expected = new OperationCanceledException("unrelated");
+        var input = new ControllablePipeReader { ReadCancellationException = expected };
+        var connection = CreateConnection(input);
+        var middleware = new Http2PrefaceConnectionMiddleware(
+            _ => Task.CompletedTask,
+            serviceContext,
+            HttpProtocols.Http1AndHttp2,
+            maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        var actual = await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Same(expected, actual);
+    }
+
+    [Fact]
+    public async Task ConnectionAbortDuringChunkCancellationStopsSelection()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
+        var input = new ControllablePipeReader
+        {
+            ReadCancellationException = new ConnectionAbortedException("aborted")
+        };
+        var connection = CreateConnection(input);
+        var tags = AddMetricsTagsFeature(connection);
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(
+            _ =>
+            {
+                nextCalled = true;
+                return Task.CompletedTask;
+            },
+            serviceContext,
+            HttpProtocols.Http1AndHttp2,
+            maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        await middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(nextCalled);
+        Assert.Empty(tags);
+    }
+
+    [Fact]
     public async Task AdvanceFailureIsSurfaced()
     {
         var expected = new InvalidOperationException("Advance failed.");
@@ -219,6 +305,73 @@ public class Http2PrefaceConnectionMiddlewareTests
 
         var actual = await Assert.ThrowsAsync<InvalidOperationException>(() => middlewareTask);
         Assert.Same(expected, actual);
+    }
+
+    [Fact]
+    public async Task LongFiniteKeepAliveAllowsProtocolSelection()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromDays(60);
+        var connection = CreateConnection(out var application);
+        await application.Output.WriteAsync("G"u8.ToArray());
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(context =>
+        {
+            nextCalled = true;
+            Assert.Equal(HttpProtocols.Http1, context.Features.Get<HttpProtocolsFeature>()?.HttpProtocols);
+            return Task.CompletedTask;
+        }, serviceContext, HttpProtocols.Http1AndHttp2);
+
+        await middleware.OnConnectionAsync(connection);
+
+        Assert.True(nextCalled);
+    }
+
+    [Fact]
+    public async Task LongFiniteKeepAliveRenewsCancellationWithoutRestartingDeadline()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
+        var input = new ControllablePipeReader();
+        var connection = CreateConnection(input);
+        var tags = AddMetricsTagsFeature(connection);
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(context =>
+        {
+            nextCalled = true;
+            Assert.Equal(HttpProtocols.Http1, context.Features.Get<HttpProtocolsFeature>()?.HttpProtocols);
+            return Task.CompletedTask;
+        }, serviceContext, HttpProtocols.Http1AndHttp2, maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        var middlewareTask = middleware.OnConnectionAsync(connection);
+        await input.SecondReadStarted.Task.DefaultTimeout();
+        input.CompleteRead(new ReadResult(new ReadOnlySequence<byte>("G"u8.ToArray()), isCanceled: false, isCompleted: false));
+        await middlewareTask.DefaultTimeout();
+
+        Assert.True(input.ReadCancellationRequested.Task.IsCompletedSuccessfully);
+        Assert.True(input.ReadCount >= 2);
+        Assert.True(nextCalled);
+        Assert.Empty(tags);
+    }
+
+    [Fact]
+    public async Task FiniteKeepAliveExpiresAcrossRenewedCancellationSources()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(1);
+        var input = new ControllablePipeReader();
+        var connection = CreateConnection(input);
+        var tags = AddMetricsTagsFeature(connection);
+        var middleware = new Http2PrefaceConnectionMiddleware(
+            _ => Task.CompletedTask,
+            serviceContext,
+            HttpProtocols.Http1AndHttp2,
+            maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        await middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(input.ReadCount >= 2);
+        Assert.Contains(tags, tag => tag.Key == "error.type" && (string)tag.Value == "keep_alive_timeout");
     }
 
     [Fact]
@@ -271,14 +424,23 @@ public class Http2PrefaceConnectionMiddlewareTests
 
     private sealed class ControllablePipeReader : PipeReader
     {
-        private readonly TaskCompletionSource<ReadResult> _readResult = new();
-        private CancellationTokenRegistration _readCancellationRegistration;
+        private readonly TaskCompletionSource<ReadResult> _readResult =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _readCount;
+
+        public int ReadCount => Volatile.Read(ref _readCount);
 
         public TaskCompletionSource ReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource SecondReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource ReadCancellationRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Action AdvanceToCallback { get; init; }
+
+        public bool ThrowOperationCanceledWithReadToken { get; init; }
+
+        public Exception ReadCancellationException { get; init; }
 
         public override void AdvanceTo(SequencePosition consumed)
         {
@@ -296,37 +458,45 @@ public class Http2PrefaceConnectionMiddlewareTests
 
         public override void Complete(Exception exception = null)
         {
-            _readCancellationRegistration.Dispose();
         }
 
         public void CompleteRead(ReadResult result)
         {
-            if (_readResult.TrySetResult(result))
-            {
-                _readCancellationRegistration.Dispose();
-            }
+            _readResult.TrySetResult(result);
         }
 
         public void FailRead(Exception exception)
         {
-            if (_readResult.TrySetException(exception))
-            {
-                _readCancellationRegistration.Dispose();
-            }
+            _readResult.TrySetException(exception);
         }
 
-        public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
         {
+            var readCount = Interlocked.Increment(ref _readCount);
             ReadStarted.TrySetResult();
-            _readCancellationRegistration = cancellationToken.UnsafeRegister(
-                static state =>
+            if (readCount == 2)
+            {
+                SecondReadStarted.TrySetResult();
+            }
+
+            if (ThrowOperationCanceledWithReadToken)
+            {
+                throw new OperationCanceledException("unexpected", null, cancellationToken);
+            }
+
+            try
+            {
+                return await _readResult.Task.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                ReadCancellationRequested.TrySetResult();
+                if (ReadCancellationException is not null)
                 {
-                    var reader = (ControllablePipeReader)state!;
-                    reader.ReadCancellationRequested.TrySetResult();
-                    reader._readResult.TrySetCanceled();
-                },
-                this);
-            return new ValueTask<ReadResult>(_readResult.Task);
+                    throw ReadCancellationException;
+                }
+                throw;
+            }
         }
 
         public override bool TryRead(out ReadResult result)

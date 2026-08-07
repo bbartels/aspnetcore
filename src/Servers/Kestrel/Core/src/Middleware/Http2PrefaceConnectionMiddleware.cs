@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
@@ -14,20 +15,25 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal;
 
 internal sealed class Http2PrefaceConnectionMiddleware
 {
+    private static readonly TimeSpan MaxCancellationDelay = TimeSpan.FromMilliseconds(int.MaxValue);
+
     private readonly ConnectionDelegate _next;
     private readonly HttpProtocols _endpointDefaultProtocols;
     private readonly TimeSpan _keepAliveTimeout;
+    private readonly TimeSpan _maxCancellationDelay;
     private readonly KestrelTrace _log;
     private readonly CancellationTokenSourcePool _ctsPool = new();
 
     public Http2PrefaceConnectionMiddleware(
         ConnectionDelegate next,
         ServiceContext serviceContext,
-        HttpProtocols endpointDefaultProtocols)
+        HttpProtocols endpointDefaultProtocols,
+        TimeSpan? maxCancellationDelay = null)
     {
         _next = next;
         _endpointDefaultProtocols = endpointDefaultProtocols;
         _keepAliveTimeout = serviceContext.ServerOptions.Limits.KeepAliveTimeout;
+        _maxCancellationDelay = maxCancellationDelay ?? MaxCancellationDelay;
         _log = serviceContext.Log;
     }
 
@@ -51,13 +57,31 @@ internal sealed class Http2PrefaceConnectionMiddleware
         var selectedProtocol = HttpProtocols.None;
         var lifetimeNotificationFeature = connectionContext.Features.Get<IConnectionLifetimeNotificationFeature>();
         var shutdownToken = lifetimeNotificationFeature?.ConnectionClosedRequested ?? default;
+        var timeoutStartTimestamp = Stopwatch.GetTimestamp();
+        var protocolSelected = false;
 
-        using (var cancellationTokenSource = _ctsPool.Rent())
-        using (shutdownToken.UnsafeRegister(static state => ((CancellationTokenSource)state!).Cancel(), cancellationTokenSource))
+        while (!protocolSelected)
         {
-            if (_keepAliveTimeout != TimeSpan.MaxValue)
+            var remainingTimeout = GetRemainingTimeout(timeoutStartTimestamp);
+            if (remainingTimeout <= TimeSpan.Zero)
             {
-                cancellationTokenSource.CancelAfter(_keepAliveTimeout);
+                if (!shutdownToken.IsCancellationRequested)
+                {
+                    RecordKeepAliveTimeout(connectionContext);
+                }
+                return;
+            }
+
+            using var cancellationTokenSource = _ctsPool.Rent();
+            using var shutdownRegistration = shutdownToken.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).Cancel(), cancellationTokenSource);
+
+            if (remainingTimeout != TimeSpan.MaxValue)
+            {
+                // CancelAfter has a finite delay limit. Renew the pooled source in chunks
+                // without restarting the overall keep-alive deadline.
+                var cancellationDelay = remainingTimeout <= _maxCancellationDelay ? remainingTimeout : _maxCancellationDelay;
+                cancellationTokenSource.CancelAfter(cancellationDelay);
             }
 
             while (true)
@@ -67,13 +91,32 @@ internal sealed class Http2PrefaceConnectionMiddleware
                 {
                     result = await input.ReadAsync(cancellationTokenSource.Token);
                 }
-                catch (OperationCanceledException) when (cancellationTokenSource.IsCancellationRequested)
+                catch (ConnectionAbortedException ex)
                 {
-                    if (!shutdownToken.IsCancellationRequested)
+                    _log.RequestProcessingError(connectionContext.ConnectionId, ex);
+                    return;
+                }
+                catch (OperationCanceledException ex)
+                {
+                    var readCancellationToken = cancellationTokenSource.Token;
+                    if (!readCancellationToken.IsCancellationRequested ||
+                        ex.CancellationToken != readCancellationToken)
+                    {
+                        throw;
+                    }
+
+                    if (shutdownToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    if (GetRemainingTimeout(timeoutStartTimestamp) <= TimeSpan.Zero)
                     {
                         RecordKeepAliveTimeout(connectionContext);
+                        return;
                     }
-                    return;
+
+                    break;
                 }
                 catch (ConnectionResetException)
                 {
@@ -85,11 +128,6 @@ internal sealed class Http2PrefaceConnectionMiddleware
                     KestrelMetrics.AddConnectionEndReason(
                         connectionContext.Features.Get<IConnectionMetricsTagsFeature>(),
                         ConnectionEndReason.IOError);
-                    return;
-                }
-                catch (ConnectionAbortedException ex)
-                {
-                    _log.RequestProcessingError(connectionContext.ConnectionId, ex);
                     return;
                 }
 
@@ -131,13 +169,19 @@ internal sealed class Http2PrefaceConnectionMiddleware
                     input.AdvanceTo(buffer.Start, examined);
                 }
 
-                if (cancellationTokenSource.IsCancellationRequested)
+                var cancellationRequested = cancellationTokenSource.IsCancellationRequested;
+                if (cancellationRequested)
                 {
-                    if (!shutdownToken.IsCancellationRequested)
+                    if (shutdownToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    if (GetRemainingTimeout(timeoutStartTimestamp) <= TimeSpan.Zero)
                     {
                         RecordKeepAliveTimeout(connectionContext);
+                        return;
                     }
-                    return;
                 }
 
                 if (inputCompleted)
@@ -148,12 +192,28 @@ internal sealed class Http2PrefaceConnectionMiddleware
                 if (selectedProtocol != HttpProtocols.None)
                 {
                     connectionContext.Features.Set(new HttpProtocolsFeature(selectedProtocol));
+                    protocolSelected = true;
+                    break;
+                }
+
+                if (cancellationRequested)
+                {
                     break;
                 }
             }
         }
 
         await _next(connectionContext);
+    }
+
+    private TimeSpan GetRemainingTimeout(long startTimestamp)
+    {
+        if (_keepAliveTimeout == TimeSpan.MaxValue)
+        {
+            return TimeSpan.MaxValue;
+        }
+
+        return _keepAliveTimeout - Stopwatch.GetElapsedTime(startTimestamp);
     }
 
     private static void RecordKeepAliveTimeout(ConnectionContext connectionContext)
