@@ -222,6 +222,26 @@ public class Http2PrefaceConnectionMiddlewareTests
     }
 
     [Fact]
+    public async Task LongFiniteKeepAliveAllowsProtocolSelection()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromDays(60);
+        var connection = CreateConnection(out var application);
+        await application.Output.WriteAsync("G"u8.ToArray());
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(context =>
+        {
+            nextCalled = true;
+            Assert.Equal(HttpProtocols.Http1, context.Features.Get<HttpProtocolsFeature>()?.HttpProtocols);
+            return Task.CompletedTask;
+        }, serviceContext, HttpProtocols.Http1AndHttp2);
+
+        await middleware.OnConnectionAsync(connection);
+
+        Assert.True(nextCalled);
+    }
+
+    [Fact]
     public async Task InfiniteKeepAliveDoesNotCancelReadUntilShutdown()
     {
         using var shutdown = new CancellationTokenSource();
@@ -271,8 +291,8 @@ public class Http2PrefaceConnectionMiddlewareTests
 
     private sealed class ControllablePipeReader : PipeReader
     {
-        private readonly TaskCompletionSource<ReadResult> _readResult = new();
-        private CancellationTokenRegistration _readCancellationRegistration;
+        private readonly TaskCompletionSource<ReadResult> _readResult =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource ReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -296,37 +316,30 @@ public class Http2PrefaceConnectionMiddlewareTests
 
         public override void Complete(Exception exception = null)
         {
-            _readCancellationRegistration.Dispose();
         }
 
         public void CompleteRead(ReadResult result)
         {
-            if (_readResult.TrySetResult(result))
-            {
-                _readCancellationRegistration.Dispose();
-            }
+            _readResult.TrySetResult(result);
         }
 
         public void FailRead(Exception exception)
         {
-            if (_readResult.TrySetException(exception))
-            {
-                _readCancellationRegistration.Dispose();
-            }
+            _readResult.TrySetException(exception);
         }
 
-        public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        public override async ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
         {
             ReadStarted.TrySetResult();
-            _readCancellationRegistration = cancellationToken.UnsafeRegister(
-                static state =>
-                {
-                    var reader = (ControllablePipeReader)state!;
-                    reader.ReadCancellationRequested.TrySetResult();
-                    reader._readResult.TrySetCanceled();
-                },
-                this);
-            return new ValueTask<ReadResult>(_readResult.Task);
+            try
+            {
+                return await _readResult.Task.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                ReadCancellationRequested.TrySetResult();
+                throw;
+            }
         }
 
         public override bool TryRead(out ReadResult result)
