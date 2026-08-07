@@ -91,15 +91,16 @@ internal sealed class Http2PrefaceConnectionMiddleware
                 {
                     result = await input.ReadAsync(cancellationTokenSource.Token);
                 }
-                catch (ConnectionAbortedException ex) when (!cancellationTokenSource.IsCancellationRequested)
+                catch (ConnectionAbortedException ex)
                 {
                     _log.RequestProcessingError(connectionContext.ConnectionId, ex);
                     return;
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
                     var readCancellationToken = cancellationTokenSource.Token;
-                    if (!readCancellationToken.IsCancellationRequested)
+                    if (!readCancellationToken.IsCancellationRequested ||
+                        ex.CancellationToken != readCancellationToken)
                     {
                         throw;
                     }

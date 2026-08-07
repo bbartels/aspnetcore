@@ -241,6 +241,54 @@ public class Http2PrefaceConnectionMiddlewareTests
     }
 
     [Fact]
+    public async Task UnrelatedOperationCanceledExceptionDuringChunkCancellationIsSurfaced()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
+        var expected = new OperationCanceledException("unrelated");
+        var input = new ControllablePipeReader { ReadCancellationException = expected };
+        var connection = CreateConnection(input);
+        var middleware = new Http2PrefaceConnectionMiddleware(
+            _ => Task.CompletedTask,
+            serviceContext,
+            HttpProtocols.Http1AndHttp2,
+            maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        var actual = await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2)));
+
+        Assert.Same(expected, actual);
+    }
+
+    [Fact]
+    public async Task ConnectionAbortDuringChunkCancellationStopsSelection()
+    {
+        var serviceContext = new TestServiceContext();
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
+        var input = new ControllablePipeReader
+        {
+            ReadCancellationException = new ConnectionAbortedException("aborted")
+        };
+        var connection = CreateConnection(input);
+        var tags = AddMetricsTagsFeature(connection);
+        var nextCalled = false;
+        var middleware = new Http2PrefaceConnectionMiddleware(
+            _ =>
+            {
+                nextCalled = true;
+                return Task.CompletedTask;
+            },
+            serviceContext,
+            HttpProtocols.Http1AndHttp2,
+            maxCancellationDelay: TimeSpan.FromMilliseconds(20));
+
+        await middleware.OnConnectionAsync(connection).WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(nextCalled);
+        Assert.Empty(tags);
+    }
+
+    [Fact]
     public async Task AdvanceFailureIsSurfaced()
     {
         var expected = new InvalidOperationException("Advance failed.");
@@ -310,7 +358,7 @@ public class Http2PrefaceConnectionMiddlewareTests
     public async Task FiniteKeepAliveExpiresAcrossRenewedCancellationSources()
     {
         var serviceContext = new TestServiceContext();
-        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromMilliseconds(100);
+        serviceContext.ServerOptions.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(1);
         var input = new ControllablePipeReader();
         var connection = CreateConnection(input);
         var tags = AddMetricsTagsFeature(connection);
@@ -392,6 +440,8 @@ public class Http2PrefaceConnectionMiddlewareTests
 
         public bool ThrowOperationCanceledWithReadToken { get; init; }
 
+        public Exception ReadCancellationException { get; init; }
+
         public override void AdvanceTo(SequencePosition consumed)
         {
             AdvanceToCallback?.Invoke();
@@ -441,6 +491,10 @@ public class Http2PrefaceConnectionMiddlewareTests
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 ReadCancellationRequested.TrySetResult();
+                if (ReadCancellationException is not null)
+                {
+                    throw ReadCancellationException;
+                }
                 throw;
             }
         }
