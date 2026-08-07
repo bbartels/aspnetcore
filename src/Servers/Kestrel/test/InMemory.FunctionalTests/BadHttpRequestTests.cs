@@ -100,6 +100,10 @@ public class BadHttpRequestTests : LoggedTest
     [Theory]
     [InlineData("NaN")]
     [InlineData("-1")]
+    [InlineData("+1")]
+    [InlineData("+0")]
+    [InlineData("-0")]
+    [InlineData("")]
     public Task BadRequestIfContentLengthInvalid(string contentLength)
     {
         return TestBadRequest(
@@ -258,8 +262,12 @@ public class BadHttpRequestTests : LoggedTest
     {
         var testMeterFactory = new TestMeterFactory();
         using var connectionDuration = new MetricCollector<double>(testMeterFactory, "Microsoft.AspNetCore.Server.Kestrel", "kestrel.connection.duration");
+        var testContext = new TestServiceContext(LoggerFactory, metrics: new KestrelMetrics(testMeterFactory));
 
-        await using (var server = new TestServer(context => Task.CompletedTask, new TestServiceContext(LoggerFactory, metrics: new KestrelMetrics(testMeterFactory))))
+        await using (var server = new TestServer(
+            context => Task.CompletedTask,
+            testContext,
+            listenOptions => listenOptions.Protocols = HttpProtocols.Http1))
         {
             using (var client = server.CreateConnection())
             {
