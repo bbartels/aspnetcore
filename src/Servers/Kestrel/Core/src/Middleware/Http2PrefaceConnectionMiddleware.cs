@@ -20,17 +20,20 @@ internal sealed class Http2PrefaceConnectionMiddleware
     private readonly ConnectionDelegate _next;
     private readonly HttpProtocols _endpointDefaultProtocols;
     private readonly TimeSpan _keepAliveTimeout;
+    private readonly TimeSpan _maxCancellationDelay;
     private readonly KestrelTrace _log;
     private readonly CancellationTokenSourcePool _ctsPool = new();
 
     public Http2PrefaceConnectionMiddleware(
         ConnectionDelegate next,
         ServiceContext serviceContext,
-        HttpProtocols endpointDefaultProtocols)
+        HttpProtocols endpointDefaultProtocols,
+        TimeSpan? maxCancellationDelay = null)
     {
         _next = next;
         _endpointDefaultProtocols = endpointDefaultProtocols;
         _keepAliveTimeout = serviceContext.ServerOptions.Limits.KeepAliveTimeout;
+        _maxCancellationDelay = maxCancellationDelay ?? MaxCancellationDelay;
         _log = serviceContext.Log;
     }
 
@@ -62,7 +65,10 @@ internal sealed class Http2PrefaceConnectionMiddleware
             var remainingTimeout = GetRemainingTimeout(timeoutStartTimestamp);
             if (remainingTimeout <= TimeSpan.Zero)
             {
-                RecordKeepAliveTimeout(connectionContext);
+                if (!shutdownToken.IsCancellationRequested)
+                {
+                    RecordKeepAliveTimeout(connectionContext);
+                }
                 return;
             }
 
@@ -74,7 +80,7 @@ internal sealed class Http2PrefaceConnectionMiddleware
             {
                 // CancelAfter has a finite delay limit. Renew the pooled source in chunks
                 // without restarting the overall keep-alive deadline.
-                var cancellationDelay = remainingTimeout <= MaxCancellationDelay ? remainingTimeout : MaxCancellationDelay;
+                var cancellationDelay = remainingTimeout <= _maxCancellationDelay ? remainingTimeout : _maxCancellationDelay;
                 cancellationTokenSource.CancelAfter(cancellationDelay);
             }
 
@@ -90,11 +96,10 @@ internal sealed class Http2PrefaceConnectionMiddleware
                     _log.RequestProcessingError(connectionContext.ConnectionId, ex);
                     return;
                 }
-                catch (OperationCanceledException ex)
+                catch (OperationCanceledException)
                 {
                     var readCancellationToken = cancellationTokenSource.Token;
-                    if (ex.CancellationToken != readCancellationToken &&
-                        !readCancellationToken.IsCancellationRequested)
+                    if (!readCancellationToken.IsCancellationRequested)
                     {
                         throw;
                     }
